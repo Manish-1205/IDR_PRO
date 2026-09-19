@@ -52,10 +52,15 @@ export class EkfCore {
     return this.aiModel;
   }
 
+  private currentTime: number = 0;
+  private lastGnssPos: number[] | null = null;
+  private lastGnssUpdateTime: number = 0;
+
   /**
    * Predict step (runs constantly at IMU rate)
    */
   public predict(dt: number, accel: number[], gyro: number[]) {
+    this.currentTime += dt;
     this.lastRawAccel = [...accel];
 
     // 0. Subtract estimated biases from raw IMU measurements
@@ -100,10 +105,10 @@ export class EkfCore {
     F.set(4, 6, -f_n.z * dt);       F.set(4, 7, 0);                F.set(4, 8, f_n.x * dt);
     F.set(5, 6, f_n.y * dt);        F.set(5, 7, -f_n.x * dt);      F.set(5, 8, 0);
 
-    // Velocity error from Accelerometer bias: C_b^n * dt
+    // Velocity error from Accelerometer bias: -C_b^n * dt (since f_true = f_meas - b_a)
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < 3; c++) {
-        F.set(3 + r, 9 + c, C_b_n[r][c] * dt);
+        F.set(3 + r, 9 + c, -C_b_n[r][c] * dt);
       }
     }
 
@@ -122,13 +127,13 @@ export class EkfCore {
     // from pinned-zero covariance to motion-trusting covariance
     let velQ = 1.0 * dt;
     if (this.postZuptCooldown > 0) {
-      velQ = 2.0 * dt; // 20x inflation during transition
+      velQ = 2.0 * dt; // 2x inflation during transition (cooldown)
       this.postZuptCooldown--;
     }
     this.lastVelQ = velQ;
     for (let i = 3; i < 6; i++) Q.set(i, i, velQ);
 
-    for (let i = 6; i < 9; i++) Q.set(i, i, 0.0001 * dt);       // attitude
+    for (let i = 6; i < 9; i++) Q.set(i, i, 0.000001 * dt);     // attitude (gyro noise ~1e-6)
     for (let i = 9; i < 12; i++) Q.set(i, i, 0.00001 * dt);     // accel bias (slow drift)
     for (let i = 12; i < 15; i++) Q.set(i, i, 0.000001 * dt);   // gyro bias (very slow drift)
 
@@ -136,6 +141,96 @@ export class EkfCore {
 
     this.applyVelocityGuard();
   }
+
+  /**
+   * Applies a generalized Kalman measurement update in Joseph form with Mahalanobis gating.
+   * Feeds back errors to INS mechanization (closed-loop EKF) and resets error states 0-8.
+   */
+  public applyMeasurementUpdate(H: Matrix, z: Matrix, R: Matrix, chiSquareThreshold: number = 6.0): boolean {
+    const S = H.mmul(this.P).mmul(H.transpose()).add(R);
+    const S_inv = inverse(S);
+    if (!S_inv) return false;
+
+    const mahalanobisSq = z.transpose().mmul(S_inv).mmul(z).get(0, 0);
+    if (mahalanobisSq >= chiSquareThreshold) {
+      return false; // Outlier rejected
+    }
+
+    const K = this.P.mmul(H.transpose()).mmul(S_inv);
+    const dx = K.mmul(z);
+    this.x = this.x.add(dx);
+
+    // Joseph-form covariance update
+    const I = Matrix.eye(15);
+    const IKH = I.sub(K.mmul(H));
+    this.P = IKH.mmul(this.P).mmul(IKH.transpose()).add(K.mmul(R).mmul(K.transpose()));
+
+    // Closed-loop state feedback to INS
+    this.ins.position.x += this.x.get(0, 0);
+    this.ins.position.y += this.x.get(1, 0);
+    this.ins.position.z += this.x.get(2, 0);
+    this.ins.velocity.x += this.x.get(3, 0);
+    this.ins.velocity.y += this.x.get(4, 0);
+    this.ins.velocity.z += this.x.get(5, 0);
+
+    // Clamp attitude error correction to max ~3 degrees (0.05 rad) per update to prevent tilt runaway
+    const maxAttJump = 0.05;
+    const dPitch = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(6, 0)));
+    const dRoll = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(7, 0)));
+    const dYaw = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(8, 0)));
+
+    this.ins.attitude.pitch += dPitch;
+    this.ins.attitude.roll += dRoll;
+    this.ins.attitude.yaw += dYaw;
+
+    // Reset error state (since we fed it back)
+    for (let i = 0; i < 9; i++) {
+      this.x.set(i, 0, 0);
+    }
+    return true;
+  }
+
+  /**
+   * Non-Holonomic Constraints (NHC)
+   * Constrains lateral (y) and vertical (z) body-frame velocity to ~0 for land vehicles.
+   * Only applied during WEAK_LOST / INS-only mode.
+   */
+  public applyNhc(R_lat: number = 0.05, R_vert: number = 0.01) {
+    const C_b_n = this.ins.lastRotationMatrix;
+    const vel = this.ins.velocity;
+
+    // Body-frame velocity components: v^b = (C_b^n)^T * v^n
+    // Lateral: v_y^b = C_01 * v_x^n + C_11 * v_y^n + C_21 * v_z^n
+    // Vertical: v_z^b = C_02 * v_x^n + C_12 * v_y^n + C_22 * v_z^n
+    const v_lat = C_b_n[0][1] * vel.x + C_b_n[1][1] * vel.y + C_b_n[2][1] * vel.z;
+    const v_vert = C_b_n[0][2] * vel.x + C_b_n[1][2] * vel.y + C_b_n[2][2] * vel.z;
+
+    const H = Matrix.zeros(2, 15);
+    // Row 0: lateral velocity constraint
+    H.set(0, 3, C_b_n[0][1]);
+    H.set(0, 4, C_b_n[1][1]);
+    H.set(0, 5, C_b_n[2][1]);
+
+    // Row 1: vertical velocity constraint
+    H.set(1, 3, C_b_n[0][2]);
+    H.set(1, 4, C_b_n[1][2]);
+    H.set(1, 5, C_b_n[2][2]);
+
+    const z = new Matrix([
+      [-v_lat],
+      [-v_vert]
+    ]);
+
+    const R = Matrix.zeros(2, 2);
+    R.set(0, 0, R_lat);
+    R.set(1, 1, R_vert);
+
+    this.applyMeasurementUpdate(H, z, R, 12.0);
+    this.applyVelocityGuard();
+  }
+
+  private lastGnssPos: number[] | null = null;
+  private lastGnssUpdateTime: number = 0;
 
   /**
    * Update step with GNSS or AI (runs when data is available)
@@ -148,9 +243,33 @@ export class EkfCore {
     let z: Matrix; // Measurement residual
     let H: Matrix; // Observation matrix
     let R: Matrix; // Measurement noise covariance
+    let threshold = 6.0;
+
+    // Derived velocity fallback from GNSS position delta if velocity is null
+    const now = Date.now();
+    let effectiveVel = gnssVel;
+    if (effectiveVel === null && this.lastGnssPos !== null && (state === 'GOOD' || state === 'DEGRADED')) {
+      const dtGnss = Math.max(0.1, (now - this.lastGnssUpdateTime) / 1000.0);
+      if (dtGnss <= 3.0) {
+        const vx = (gnssPos[0] - this.lastGnssPos[0]) / dtGnss;
+        const vy = (gnssPos[1] - this.lastGnssPos[1]) / dtGnss;
+        const vz = (gnssPos[2] - this.lastGnssPos[2]) / dtGnss;
+        const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        if (speed < 40) {
+          effectiveVel = [vx, vy, vz];
+        }
+      }
+    }
+    if (state === 'GOOD' || state === 'DEGRADED') {
+      this.lastGnssPos = [...gnssPos];
+      this.lastGnssUpdateTime = now;
+    }
 
     if (state === 'GOOD' || state === 'DEGRADED') {
-      if (gnssVel !== null) {
+      // Dynamic base variance scaled to reported GNSS accuracy (or standard ~1m if unknown)
+      const basePosVar = accuracy !== null && accuracy > 0 ? Math.max(0.1, (accuracy * accuracy) / 9.0) : 1.0;
+
+      if (effectiveVel !== null) {
         // GNSS Update (Position & Velocity)
         // Observation: 6D (pos x,y,z, vel x,y,z)
         H = Matrix.zeros(6, 15);
@@ -158,19 +277,11 @@ export class EkfCore {
           H.set(i, i, 1);
         }
 
-        if (state === 'GOOD') {
-          // Tight R-matrix directly from accuracy
-          const posVar = accuracy ? accuracy * accuracy : 1.0;
-          R = Matrix.eye(6).mul(posVar);
-          for (let i = 3; i < 6; i++) {
-            R.set(i, i, 0.1); // Base vel var
-          }
-        } else {
-          // Base measurement noise for GNSS (e.g. ~1m pos variance, ~0.1m/s vel variance)
-          R = Matrix.eye(6).mul(1.0);
-          for (let i = 3; i < 6; i++) {
-            R.set(i, i, 0.1); 
-          }
+        R = Matrix.eye(6).mul(basePosVar);
+        for (let i = 3; i < 6; i++) {
+          R.set(i, i, gnssVel !== null ? 0.1 : 0.5); 
+        }
+        if (state === 'DEGRADED') {
           R = R.mulColumnVector(Matrix.columnVector(Array(6).fill(rScale)));
         }
 
@@ -179,10 +290,11 @@ export class EkfCore {
           [gnssPos[0] - this.ins.position.x],
           [gnssPos[1] - this.ins.position.y],
           [gnssPos[2] - this.ins.position.z],
-          [gnssVel[0] - this.ins.velocity.x],
-          [gnssVel[1] - this.ins.velocity.y],
-          [gnssVel[2] - this.ins.velocity.z],
+          [effectiveVel[0] - this.ins.velocity.x],
+          [effectiveVel[1] - this.ins.velocity.y],
+          [effectiveVel[2] - this.ins.velocity.z],
         ]);
+        threshold = 12.6;
       } else {
         // GNSS Update (Position Only)
         // Observation: 3D (pos x,y,z)
@@ -191,13 +303,8 @@ export class EkfCore {
           H.set(i, i, 1);
         }
 
-        if (state === 'GOOD') {
-          // Tight R-matrix directly from accuracy
-          const posVar = accuracy ? accuracy * accuracy : 1.0;
-          R = Matrix.eye(3).mul(posVar);
-        } else {
-          // Base measurement noise for GNSS position
-          R = Matrix.eye(3).mul(1.0);
+        R = Matrix.eye(3).mul(basePosVar);
+        if (state === 'DEGRADED') {
           R = R.mulColumnVector(Matrix.columnVector(Array(3).fill(rScale)));
         }
 
@@ -207,8 +314,10 @@ export class EkfCore {
           [gnssPos[1] - this.ins.position.y],
           [gnssPos[2] - this.ins.position.z],
         ]);
+        threshold = 7.8;
       }
 
+      this.applyMeasurementUpdate(H, z, R, threshold);
 
     } else {
       // WEAK_LOST State: Use AI pseudo-measurement and NHC
@@ -241,60 +350,10 @@ export class EkfCore {
         R = Matrix.eye(2).mul(1000); // Discard
       }
 
-      // Also apply Non-Holonomic Constraints (NHC): Lateral & Vertical velocity in body frame is ~0
-      // For a simple implementation, we just strongly damp lateral/vertical growth.
-      // (Full NHC requires rotating to body frame via H matrix).
-    }
+      this.applyMeasurementUpdate(H, z, R, 6.0);
 
-    // --- Standard EKF Update Equations ---
-    // Innovation covariance S = H * P * H^T + R
-    const S = H.mmul(this.P).mmul(H.transpose()).add(R);
-    
-    // Mahalanobis distance gating
-    const S_inv = inverse(S);
-    if (S_inv) {
-      const mahalanobisSq = z.transpose().mmul(S_inv).mmul(z).get(0, 0);
-      
-      // Chi-square threshold (e.g., 95% confidence for 6 DOF is ~12.6, 3 DOF is ~7.8, 2 DOF is ~6.0)
-      let threshold = 6.0;
-      if (H.rows === 6) threshold = 12.6;
-      else if (H.rows === 3) threshold = 7.8;
-      
-      if (mahalanobisSq < threshold) {
-        // Kalman Gain K = P * H^T * S^-1
-        const K = this.P.mmul(H.transpose()).mmul(S_inv);
-
-        // Update state x = x + K * z
-        const dx = K.mmul(z);
-        this.x = this.x.add(dx);
-
-        // Update covariance P (Joseph form)
-        const I = Matrix.eye(15);
-        const IKH = I.sub(K.mmul(H));
-        this.P = IKH.mmul(this.P).mmul(IKH.transpose()).add(K.mmul(R).mmul(K.transpose()));
-
-        // Feed back errors into INS Mechanization (closed-loop EKF)
-        const posBefore = { ...this.ins.position };
-        this.ins.position.x += this.x.get(0, 0);
-        this.ins.position.y += this.x.get(1, 0);
-        this.ins.position.z += this.x.get(2, 0);
-        // console.log(`[UPDATE_GNSS] state=${state}, mahalanobis=${mahalanobisSq.toFixed(2)}, posBefore: ${posBefore.x.toFixed(3)}, ${posBefore.y.toFixed(3)}, posAfter: ${this.ins.position.x.toFixed(3)}, ${this.ins.position.y.toFixed(3)}`);
-        this.ins.velocity.x += this.x.get(3, 0);
-        this.ins.velocity.y += this.x.get(4, 0);
-        this.ins.velocity.z += this.x.get(5, 0);
-        this.ins.attitude.pitch += this.x.get(6, 0);
-        this.ins.attitude.roll += this.x.get(7, 0);
-        this.ins.attitude.yaw += this.x.get(8, 0);
-        // Biases are kept in the state vector
-
-        // Reset error state (since we fed it back)
-        for (let i = 0; i < 9; i++) {
-          this.x.set(i, 0, 0);
-        }
-      } else {
-        // Outlier rejected!
-        // console.warn("EKF Update Rejected (Mahalanobis Distance > Threshold)");
-      }
+      // 2. Apply Non-Holonomic Constraints (NHC) in WEAK_LOST mode
+      this.applyNhc(0.05, 0.01);
     }
 
     this.applyVelocityGuard();
@@ -320,33 +379,7 @@ export class EkfCore {
       [-this.ins.velocity.z]
     ]);
 
-    const S = H.mmul(this.P).mmul(H.transpose()).add(R);
-    const S_inv = inverse(S);
-
-    if (S_inv) {
-      const K = this.P.mmul(H.transpose()).mmul(S_inv);
-      const dx = K.mmul(z);
-      this.x = this.x.add(dx);
-
-      const I = Matrix.eye(15);
-      const IKH = I.sub(K.mmul(H));
-      this.P = IKH.mmul(this.P).mmul(IKH.transpose()).add(K.mmul(R).mmul(K.transpose()));
-
-      this.ins.position.x += this.x.get(0, 0);
-      this.ins.position.y += this.x.get(1, 0);
-      this.ins.position.z += this.x.get(2, 0);
-      this.ins.velocity.x += this.x.get(3, 0);
-      this.ins.velocity.y += this.x.get(4, 0);
-      this.ins.velocity.z += this.x.get(5, 0);
-      this.ins.attitude.pitch += this.x.get(6, 0);
-      this.ins.attitude.roll += this.x.get(7, 0);
-      this.ins.attitude.yaw += this.x.get(8, 0);
-
-      // Reset error state
-      for (let i = 0; i < 9; i++) {
-        this.x.set(i, 0, 0);
-      }
-    }
+    this.applyMeasurementUpdate(H, z, R, 7.8);
 
     // Track ZUPT state for Q scheduling: when ZUPT stops, start cooldown
     this.wasZuptActive = true;

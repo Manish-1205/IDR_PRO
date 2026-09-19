@@ -4,6 +4,7 @@ export interface IMUData {
   x: number;
   y: number;
   z: number;
+  timestamp?: number;
 }
 
 export interface GNSSData {

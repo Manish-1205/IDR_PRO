@@ -166,6 +166,8 @@ export default function FusionDebugScreen() {
             </View>
           </View>
           
+          <Text style={styles.data}>Pure GNSS Lat: {rawSensors.gnss.latitude?.toFixed(7) || 'Wait...'}</Text>
+          <Text style={styles.data}>Pure GNSS Lon: {rawSensors.gnss.longitude?.toFixed(7) || 'Wait...'}</Text>
           <Text style={styles.data}>Fused Lat (AI/GNSS): {fusedState.latitude?.toFixed(7) || 'Wait...'}</Text>
           <Text style={styles.data}>Fused Lon (AI/GNSS): {fusedState.longitude?.toFixed(7) || 'Wait...'}</Text>
           <Text style={styles.data}>Pure INS Lat: {fusedState.pureInsLatitude?.toFixed(7) || 'Wait...'}</Text>

@@ -23,6 +23,7 @@ describe('GNSS Q-Matrix Verification', () => {
         let maxError = 0;
         let totalError = 0;
         let updateCount = 0;
+        let maxVelocity = 0; // Track peak velocity across all predict steps
 
         for (let i = 1; i < lines.length; i++) {
             const cols = lines[i].split(',');
@@ -49,6 +50,11 @@ describe('GNSS Q-Matrix Verification', () => {
 
             // Predict
             ekf.predict(dt, [accX, accY, accZ], [gyrX, gyrY, gyrZ]);
+
+            // Track max velocity at every predict step (catches runaway before GNSS update)
+            const vel = ekf.getIns().velocity;
+            const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+            if (speed > maxVelocity) maxVelocity = speed;
 
             // If new GNSS fix arrived
             if (gnssLat !== lastGnssLat || gnssLon !== lastGnssLon || i === 1) {
@@ -84,7 +90,7 @@ describe('GNSS Q-Matrix Verification', () => {
                 console.log(`[Update ${updateCount}] GNSS dx=${dx.toFixed(3)}, dy=${dy.toFixed(3)} | ` +
                             `Before: ${posBefore.x.toFixed(3)}, ${posBefore.y.toFixed(3)} | ` +
                             `After: ${posAfter.x.toFixed(3)}, ${posAfter.y.toFixed(3)} | ` +
-                            `Error: ${errorMag.toFixed(3)}m`);
+                            `Error: ${errorMag.toFixed(3)}m | Speed: ${speed.toFixed(2)} m/s`);
             }
         }
         
@@ -92,6 +98,14 @@ describe('GNSS Q-Matrix Verification', () => {
         console.log(`\n--- STATS ---`);
         console.log(`Max Error: ${maxError.toFixed(3)}m`);
         console.log(`Avg Error: ${avgError.toFixed(3)}m`);
+        console.log(`Max Velocity: ${maxVelocity.toFixed(3)} m/s`);
         console.log(`Updates Processed: ${updateCount}`);
+
+        // --- Real assertions: these must pass for the CI gate to be trusted ---
+        // Max position error after each GNSS update must be < 10m (urban threshold from audit)
+        expect(maxError).toBeLessThan(10);
+        // Velocity must never exceed a realistic vehicle bound (40 m/s ≈ 144 km/h).
+        // Values above this indicate EKF runaway divergence, not real motion.
+        expect(maxVelocity).toBeLessThan(40);
     });
 });

@@ -14,6 +14,7 @@ export interface FusedState {
   pureInsLongitude: number | null;
   accelBias: { x: number; y: number; z: number };
   gyroBias: { x: number; y: number; z: number };
+  isAligned: boolean;
 }
 
 class FusionRuntime {
@@ -146,24 +147,8 @@ class FusionRuntime {
       this.imuWindow.shift();
     }
 
-    if (!this.isAttitudeInitialized) {
-      const initialAccel = { x: imuSample[0], y: imuSample[1], z: imuSample[2] };
-      this.ekf.getIns().initializeAttitude(initialAccel);
-      this.pureIns.initializeAttitude(initialAccel);
-      this.isAttitudeInitialized = true;
-    }
-
-    // EKF Predict
-    this.ekf.predict(dt, [imuSample[0], imuSample[1], imuSample[2]], [imuSample[3], imuSample[4], imuSample[5]]);
-
-    // Pure INS Predict (for comparison, without any bias correction or updates)
-    this.pureIns.predict(
-      dt, 
-      { x: imuSample[0], y: imuSample[1], z: imuSample[2] }, 
-      { x: imuSample[3], y: imuSample[4], z: imuSample[5] }
-    );
-
-    // ZUPT (Zero Velocity Update) Detection with hysteresis
+    // ZUPT / Stationary Detection
+    let isStationary = false;
     if (this.imuWindow.length >= 20) {
       const n = this.imuWindow.length;
       let sumAx = 0, sumAy = 0, sumAz = 0;
@@ -183,9 +168,42 @@ class FusionRuntime {
       varA /= n;
       varG /= n;
 
-      // Thresholds tuned for real MEMS phone sensors (accel noise ~0.05 m/s², gyro noise ~0.01 rad/s)
-      const isStationary = varA < 0.5 && varG < 0.05;
+      isStationary = varA < 0.5 && varG < 0.05;
 
+      // Initial Stationary Alignment Phase
+      if (!this.isAttitudeInitialized) {
+        if (isStationary) {
+          // Initialize using the stable averaged gravity vector
+          const initialAccel = { x: meanAx, y: meanAy, z: meanAz };
+          this.ekf.getIns().initializeAttitude(initialAccel);
+          this.pureIns.initializeAttitude(initialAccel);
+          this.isAttitudeInitialized = true;
+          console.log("[FusionRuntime] Initial alignment complete. EKF started.");
+        } else {
+          // Device is moving. Do not initialize yet. Just emit unaligned state.
+          this.emitFusedState();
+          return;
+        }
+      }
+    } else {
+      // Buffer not full yet. Cannot initialize or run ZUPT.
+      if (!this.isAttitudeInitialized) {
+        this.emitFusedState();
+        return;
+      }
+    }
+
+    // EKF Predict
+    this.ekf.predict(dt, [imuSample[0], imuSample[1], imuSample[2]], [imuSample[3], imuSample[4], imuSample[5]]);
+
+    // Pure INS Predict (for comparison, without any bias correction or updates)
+    this.pureIns.predict(
+      dt, 
+      { x: imuSample[0], y: imuSample[1], z: imuSample[2] }, 
+      { x: imuSample[3], y: imuSample[4], z: imuSample[5] }
+    );
+
+    if (this.imuWindow.length >= 20) {
       if (isStationary) {
         // Immediately apply ZUPT when stationary
         this.ekf.updateZupt();
@@ -274,7 +292,8 @@ class FusionRuntime {
       pureInsLatitude: pureInsLat,
       pureInsLongitude: pureInsLon,
       accelBias: biases.accel,
-      gyroBias: biases.gyro
+      gyroBias: biases.gyro,
+      isAligned: this.isAttitudeInitialized
     });
   }
 }

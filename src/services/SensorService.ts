@@ -36,35 +36,49 @@ class SensorService {
   public async startAcquisition() {
     useSensorStore.getState().setIsAcquiring(true);
 
-    this.accelSubscription = Accelerometer.addListener((data) => {
+    this.accelSubscription = Accelerometer.addListener((data: any) => {
       // expo-sensors gives Accel in G's (approx 9.81 m/s^2)
       // We'll multiply by 9.81 to get m/s^2
+      const ts = data.timestamp || Date.now();
       const accelInMs2 = {
         x: data.x * 9.81,
         y: data.y * 9.81,
         z: data.z * 9.81,
+        timestamp: ts,
       };
       useSensorStore.getState().setAccel(accelInMs2);
       this.addSampleToBuffer({
-        timestamp: Date.now(),
+        timestamp: ts,
         type: 'IMU',
         data: { sensor: 'accelerometer', ...accelInMs2 }
       });
     });
 
-    this.gyroSubscription = Gyroscope.addListener((data) => {
-      useSensorStore.getState().setGyro(data);
+    this.gyroSubscription = Gyroscope.addListener((data: any) => {
+      const ts = data.timestamp || Date.now();
+      useSensorStore.getState().setGyro({
+        x: data.x,
+        y: data.y,
+        z: data.z,
+        timestamp: ts,
+      });
       this.addSampleToBuffer({
-        timestamp: Date.now(),
+        timestamp: ts,
         type: 'IMU',
         data: { sensor: 'gyroscope', ...data }
       });
     });
 
-    this.magSubscription = Magnetometer.addListener((data) => {
-      useSensorStore.getState().setMag(data);
+    this.magSubscription = Magnetometer.addListener((data: any) => {
+      const ts = data.timestamp || Date.now();
+      useSensorStore.getState().setMag({
+        x: data.x,
+        y: data.y,
+        z: data.z,
+        timestamp: ts,
+      });
       this.addSampleToBuffer({
-        timestamp: Date.now(),
+        timestamp: ts,
         type: 'IMU',
         data: { sensor: 'magnetometer', ...data }
       });
