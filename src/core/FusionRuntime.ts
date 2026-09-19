@@ -1,6 +1,7 @@
 import { useSensorStore } from '../store/useSensorStore';
 import { EkfCore } from './EkfCore';
 import { InsMechanization } from './InsMechanization';
+import { OutputStabilizer, StabilizerInput } from './OutputStabilizer';
 
 export interface FusedState {
   latitude: number | null;
@@ -15,11 +16,17 @@ export interface FusedState {
   accelBias: { x: number; y: number; z: number };
   gyroBias: { x: number; y: number; z: number };
   isAligned: boolean;
+  stabilization?: {
+    wasClamped: boolean;
+    wasSmoothed: boolean;
+    clampEvent?: any;
+  };
 }
 
 class FusionRuntime {
   private ekf: EkfCore;
   private pureIns: InsMechanization;
+  private outputStabilizer: OutputStabilizer;
   private isRunning = false;
   private unsubscribe: (() => void) | null = null;
 
@@ -45,6 +52,7 @@ class FusionRuntime {
   constructor() {
     this.ekf = new EkfCore();
     this.pureIns = new InsMechanization();
+    this.outputStabilizer = new OutputStabilizer({ maxSpeedMps: 33.3, maxAccelMps2: 9.8 });
     // Pre-fill IMU window with zeros
     for (let i = 0; i < 20; i++) {
       this.imuWindow.push([0, 0, 9.81, 0, 0, 0]);
@@ -279,6 +287,24 @@ class FusionRuntime {
     let headingDeg = att.yaw * (180 / Math.PI);
     if (headingDeg < 0) headingDeg += 360;
 
+    let stabilizationInfo = undefined;
+    if (this.initialLat !== null && fusedLat !== null && fusedLon !== null) {
+      const stabilizerInput: StabilizerInput = {
+        lat: fusedLat,
+        lon: fusedLon,
+        timestamp: Date.now(),
+        gnssState: state
+      };
+      const stabilized = this.outputStabilizer.process(stabilizerInput);
+      fusedLat = stabilized.lat;
+      fusedLon = stabilized.lon;
+      stabilizationInfo = {
+        wasClamped: stabilized.wasClamped,
+        wasSmoothed: stabilized.wasSmoothed,
+        clampEvent: stabilized.clampEvent
+      };
+    }
+
     const biases = this.ekf.getBiases ? this.ekf.getBiases() : { accel: {x:0,y:0,z:0}, gyro: {x:0,y:0,z:0} };
 
     this.onFusedDataCallback({
@@ -293,7 +319,8 @@ class FusionRuntime {
       pureInsLongitude: pureInsLon,
       accelBias: biases.accel,
       gyroBias: biases.gyro,
-      isAligned: this.isAttitudeInitialized
+      isAligned: this.isAttitudeInitialized,
+      stabilization: stabilizationInfo
     });
   }
 }
