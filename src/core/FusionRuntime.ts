@@ -185,6 +185,7 @@ class FusionRuntime {
           const initialAccel = { x: meanAx, y: meanAy, z: meanAz };
           this.ekf.getIns().initializeAttitude(initialAccel);
           this.pureIns.initializeAttitude(initialAccel);
+          this.ekf.notifyAttitudeInitialized(); // Unlocks NHC — C_b_n is now valid
           this.isAttitudeInitialized = true;
           console.log("[FusionRuntime] Initial alignment complete. EKF started.");
         } else {
@@ -200,6 +201,8 @@ class FusionRuntime {
         return;
       }
     }
+    const posBefore = { ...this.ekf.getPosition() };
+    const purePosBefore = { ...this.pureIns.position };
 
     // EKF Predict
     this.ekf.predict(dt, [imuSample[0], imuSample[1], imuSample[2]], [imuSample[3], imuSample[4], imuSample[5]]);
@@ -217,12 +220,28 @@ class FusionRuntime {
         this.ekf.updateZupt();
         this.wasZuptActiveLastCycle = true;
         this.nonStationaryCount = 0;
+
+        // Hard-freeze position to completely eliminate stationary drift
+        this.ekf.getPosition().x = posBefore.x;
+        this.ekf.getPosition().y = posBefore.y;
+        this.ekf.getPosition().z = posBefore.z;
+        this.pureIns.position.x = purePosBefore.x;
+        this.pureIns.position.y = purePosBefore.y;
+        this.pureIns.position.z = purePosBefore.z;
       } else {
         // Hysteresis: require N consecutive non-stationary samples before releasing ZUPT
         this.nonStationaryCount++;
         if (this.nonStationaryCount <= this.ZUPT_RELEASE_HYSTERESIS) {
           // Still within hysteresis window — keep applying ZUPT to prevent toggling
           this.ekf.updateZupt();
+
+          // Hard-freeze position during hysteresis as well
+          this.ekf.getPosition().x = posBefore.x;
+          this.ekf.getPosition().y = posBefore.y;
+          this.ekf.getPosition().z = posBefore.z;
+          this.pureIns.position.x = purePosBefore.x;
+          this.pureIns.position.y = purePosBefore.y;
+          this.pureIns.position.z = purePosBefore.z;
         } else if (this.wasZuptActiveLastCycle) {
           // ZUPT release: notify EKF to inflate Q for graceful transition
           this.ekf.notifyZuptReleased();

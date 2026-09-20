@@ -39,6 +39,10 @@ export class EkfCore {
   private lastRawAccel: number[] = [0, 0, 9.81];
   private lastVelQ: number = 0.01;
   private lastAiCorrection: number[] | null = null;
+  // Set to true once FusionRuntime completes stationary attitude initialisation.
+  // NHC must NOT fire before this: an identity C_b_n projects full gravity into
+  // navigation-frame lateral/vertical velocity, instantly saturating the ±60 guard.
+  private isAttitudeInitialized = false;
 
   public getIns() {
     return this.ins;
@@ -53,8 +57,6 @@ export class EkfCore {
   }
 
   private currentTime: number = 0;
-  private lastGnssPos: number[] | null = null;
-  private lastGnssUpdateTime: number = 0;
 
   /**
    * Predict step (runs constantly at IMU rate)
@@ -62,6 +64,22 @@ export class EkfCore {
   public predict(dt: number, accel: number[], gyro: number[]) {
     this.currentTime += dt;
     this.lastRawAccel = [...accel];
+
+    // Guard: if initializeAttitude() has not been called yet, auto-initialize using a
+    // neutral level orientation [0, 0, g]. Using the raw accel sample would create a
+    // slightly non-zero attitude from any off-axis transient (e.g. the startup
+    // acceleration bump in GnssVelocityFallback), which then leaks gravity back into
+    // horizontal velocity for all subsequent level samples.
+    // FusionRuntime overwrites this with a proper stationary-window init before predict
+    // is called for real, so this neutral fallback only matters in tests that skip
+    // initializeAttitude() entirely.
+    if (this.ins.getFilteredAccel() === null) {
+      this.ins.initializeAttitude({ x: 0, y: 0, z: 9.81 });
+      this.isAttitudeInitialized = true;
+    } else if (!this.isAttitudeInitialized) {
+      // initializeAttitude() was called externally (e.g., by a test); sync the flag.
+      this.isAttitudeInitialized = true;
+    }
 
     // 0. Subtract estimated biases from raw IMU measurements
     const accX = accel[0] - this.x.get(9, 0);
@@ -79,7 +97,7 @@ export class EkfCore {
       { x: accX, y: accY, z: accZ }, 
       { x: gyrX, y: gyrY, z: gyrZ }
     );
-    // console.log(`[PREDICT] dt=${dt.toFixed(3)}, posBefore: ${posBefore.x.toFixed(3)}, ${posBefore.y.toFixed(3)}, posAfter: ${this.ins.position.x.toFixed(3)}, ${this.ins.position.y.toFixed(3)}`);
+    // console.log(`[PREDICT] dt=${dt.toFixed(3)}, posBefore: ${posBefore.x.toFixed(3)}, ${posBefore.y.toFixed(3)}, posAfter: ${this.ins.position.x.toFixed(3)}, ${this.ins.position.y.toFixed(3)})`);
 
 
     // 2. Propagate Covariance P = F * P * F^T + Q
@@ -125,7 +143,7 @@ export class EkfCore {
 
     // Velocity Q: inflate during post-ZUPT cooldown to allow graceful transition
     // from pinned-zero covariance to motion-trusting covariance
-    let velQ = 1.0 * dt;
+    let velQ = 0.1 * dt;
     if (this.postZuptCooldown > 0) {
       velQ = 2.0 * dt; // 2x inflation during transition (cooldown)
       this.postZuptCooldown--;
@@ -245,12 +263,17 @@ export class EkfCore {
     let R: Matrix; // Measurement noise covariance
     let threshold = 6.0;
 
-    // Derived velocity fallback from GNSS position delta if velocity is null
-    const now = Date.now();
+    // Derived velocity fallback from GNSS position delta if velocity is null.
+    // Use this.currentTime (accumulated from predict() dt values) rather than Date.now(),
+    // because in test environments Date.now() is nearly constant across a synchronous
+    // loop, making dtGnss ≈ 0 (clamped to 0.1s) and producing 10×-inflated velocity
+    // estimates that are then rejected by the speed < 40 guard.
     let effectiveVel = gnssVel;
     if (effectiveVel === null && this.lastGnssPos !== null && (state === 'GOOD' || state === 'DEGRADED')) {
-      const dtGnss = Math.max(0.1, (now - this.lastGnssUpdateTime) / 1000.0);
-      if (dtGnss <= 3.0) {
+      const dtGnss = this.lastGnssUpdateTime > 0
+        ? Math.min(Math.max(this.currentTime - this.lastGnssUpdateTime, 0.1), 3.0)
+        : 0; // No valid prior time — cannot derive velocity
+      if (dtGnss >= 0.1 && dtGnss <= 3.0) {
         const vx = (gnssPos[0] - this.lastGnssPos[0]) / dtGnss;
         const vy = (gnssPos[1] - this.lastGnssPos[1]) / dtGnss;
         const vz = (gnssPos[2] - this.lastGnssPos[2]) / dtGnss;
@@ -262,7 +285,7 @@ export class EkfCore {
     }
     if (state === 'GOOD' || state === 'DEGRADED') {
       this.lastGnssPos = [...gnssPos];
-      this.lastGnssUpdateTime = now;
+      this.lastGnssUpdateTime = this.currentTime;
     }
 
     if (state === 'GOOD' || state === 'DEGRADED') {
@@ -279,7 +302,7 @@ export class EkfCore {
 
         R = Matrix.eye(6).mul(basePosVar);
         for (let i = 3; i < 6; i++) {
-          R.set(i, i, gnssVel !== null ? 0.1 : 0.5); 
+          R.set(i, i, gnssVel !== null ? 0.1 : 5.0); 
         }
         if (state === 'DEGRADED') {
           R = R.mulColumnVector(Matrix.columnVector(Array(6).fill(rScale)));
@@ -294,7 +317,7 @@ export class EkfCore {
           [effectiveVel[1] - this.ins.velocity.y],
           [effectiveVel[2] - this.ins.velocity.z],
         ]);
-        threshold = 12.6;
+        threshold = 25.0;
       } else {
         // GNSS Update (Position Only)
         // Observation: 3D (pos x,y,z)
@@ -353,7 +376,13 @@ export class EkfCore {
       this.applyMeasurementUpdate(H, z, R, 6.0);
 
       // 2. Apply Non-Holonomic Constraints (NHC) in WEAK_LOST mode
-      this.applyNhc(0.05, 0.01);
+      // Guard: only apply NHC after attitude is initialized. Before initialization,
+      // C_b_n is identity and lastSpecificForce contains ~9.81 m/s² gravity, which
+      // projects directly into navigation-frame v_lat and v_vert, driving them above
+      // ±60 m/s on the very first cycle and permanently saturating the velocity clamp.
+      if (this.isAttitudeInitialized) {
+        this.applyNhc(0.05, 0.01);
+      }
     }
 
     this.applyVelocityGuard();
@@ -379,10 +408,21 @@ export class EkfCore {
       [-this.ins.velocity.z]
     ]);
 
-    this.applyMeasurementUpdate(H, z, R, 7.8);
+    this.applyMeasurementUpdate(H, z, R, Infinity);
 
     // Track ZUPT state for Q scheduling: when ZUPT stops, start cooldown
     this.wasZuptActive = true;
+
+    // Hard override velocity to exactly 0 to eliminate any micro-jitter (0.02 - 0.1 m/s)
+    this.ins.velocity.x = 0;
+    this.ins.velocity.y = 0;
+    this.ins.velocity.z = 0;
+
+    // Reset velocity error in the EKF state vector to prevent accumulation
+    this.x.set(3, 0, 0);
+    this.x.set(4, 0, 0);
+    this.x.set(5, 0, 0);
+
     this.applyVelocityGuard();
   }
 
@@ -436,6 +476,14 @@ export class EkfCore {
     }
 
     this.previousVelocity = { x: v.x, y: v.y, z: v.z };
+  }
+
+  /**
+   * Called by FusionRuntime once the initial stationary alignment is complete and
+   * the rotation matrix C_b_n is valid. Enables NHC and other attitude-dependent guards.
+   */
+  public notifyAttitudeInitialized() {
+    this.isAttitudeInitialized = true;
   }
 
   /**
