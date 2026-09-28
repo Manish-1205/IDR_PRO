@@ -1,5 +1,8 @@
-import { create } from 'zustand';
-export const useSensorStore = create((set) => ({
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.useSensorStore = void 0;
+const zustand_1 = require("zustand");
+exports.useSensorStore = (0, zustand_1.create)((set) => ({
     isAcquiring: false,
     accel: { x: 0, y: 0, z: 0 },
     gyro: { x: 0, y: 0, z: 0 },

@@ -13,6 +13,14 @@ export class EkfCore {
   private x: Matrix;
   private P: Matrix;
 
+  public enableYawAlignment: boolean = false;
+  public enableNHC: boolean = false;
+  public enableBumpGate: boolean = false;
+  public bumpGateCount: number = 0;
+
+  private yawOffsetRad: number = 0; // The angle between the phone's forward axis and the vehicle's forward axis
+  private yawOffsetActive: boolean = false; // Whether we have a valid estimate
+
   private ins: InsMechanization;
   private gnssState: GnssQualityStateMachine;
   private aiModel: AiMotionModel;
@@ -141,17 +149,37 @@ export class EkfCore {
     const Q = Matrix.zeros(15, 15);
     for (let i = 0; i < 3; i++) Q.set(i, i, 0.1 * dt);         // position
 
+    // Phase 4: Bump / Pothole Gate
+    let bumpDetected = false;
+    if (this.enableBumpGate) {
+      // Simple high-pass proxy: deviation of raw accel magnitude from 1g, and high gyro magnitude
+      const accelMag = Math.sqrt(accel[0]*accel[0] + accel[1]*accel[1] + accel[2]*accel[2]);
+      const gyroMag = Math.sqrt(gyro[0]*gyro[0] + gyro[1]*gyro[1] + gyro[2]*gyro[2]);
+      
+      const accelDeviation = Math.abs(accelMag - 9.81);
+      
+      // Thresholds: e.g. > 3 m/s^2 deviation or > 1.0 rad/s rotation
+      if (accelDeviation > 3.0 || gyroMag > 1.0) {
+        bumpDetected = true;
+        this.bumpGateCount++;
+      }
+    }
+
     // Velocity Q: inflate during post-ZUPT cooldown to allow graceful transition
-    // from pinned-zero covariance to motion-trusting covariance
+    // Also inflate if bump/pothole detected to reduce trust in IMU during vibration
     let velQ = 0.1 * dt;
     if (this.postZuptCooldown > 0) {
       velQ = 2.0 * dt; // 2x inflation during transition (cooldown)
       this.postZuptCooldown--;
     }
+    if (bumpDetected) {
+      velQ = Math.max(velQ, 5.0 * dt); // Massive inflation during bumps
+    }
+
     this.lastVelQ = velQ;
     for (let i = 3; i < 6; i++) Q.set(i, i, velQ);
 
-    for (let i = 6; i < 9; i++) Q.set(i, i, 0.000001 * dt);     // attitude (gyro noise ~1e-6)
+    for (let i = 6; i < 9; i++) Q.set(i, i, bumpDetected ? 0.001 * dt : 0.000001 * dt);     // attitude (gyro noise ~1e-6)
     for (let i = 9; i < 12; i++) Q.set(i, i, 0.00001 * dt);     // accel bias (slow drift)
     for (let i = 12; i < 15; i++) Q.set(i, i, 0.000001 * dt);   // gyro bias (very slow drift)
 
@@ -216,23 +244,48 @@ export class EkfCore {
   public applyNhc(R_lat: number = 0.05, R_vert: number = 0.01) {
     const C_b_n = this.ins.lastRotationMatrix;
     const vel = this.ins.velocity;
+    // Adjust the rotation matrix for the phone-to-vehicle yaw offset
+    // C_b_v = Rz(-yawOffsetRad)
+    // Then C_v_n = C_b_n * C_v_b = C_b_n * Rz(yawOffsetRad)
+    // The lateral vehicle axis in the navigation frame is the 2nd column of C_v_n
+    const cosY = Math.cos(this.yawOffsetRad);
+    const sinY = Math.sin(this.yawOffsetRad);
 
-    // Body-frame velocity components: v^b = (C_b^n)^T * v^n
-    // Lateral: v_y^b = C_01 * v_x^n + C_11 * v_y^n + C_21 * v_z^n
-    // Vertical: v_z^b = C_02 * v_x^n + C_12 * v_y^n + C_22 * v_z^n
-    const v_lat = C_b_n[0][1] * vel.x + C_b_n[1][1] * vel.y + C_b_n[2][1] * vel.z;
-    const v_vert = C_b_n[0][2] * vel.x + C_b_n[1][2] * vel.y + C_b_n[2][2] * vel.z;
+    // C_v_n column 0 (forward): 
+    // fx = C00*cosY + C01*sinY
+    // fy = C10*cosY + C11*sinY
+    // fz = C20*cosY + C21*sinY
+    
+    // C_v_n column 1 (lateral):
+    // lx = -C00*sinY + C01*cosY
+    // ly = -C10*sinY + C11*cosY
+    // lz = -C20*sinY + C21*cosY
+    
+    // C_v_n column 2 (vertical) remains C_b_n column 2 because we only rotate yaw (around z)
+    // Actually, phone might be pitched, so vehicle vertical is not exactly phone vertical, but
+    // usually pitch/roll are estimated via gravity. Assuming phone Z is vehicle Z for now.
+
+    const l_x = -C_b_n[0][0] * sinY + C_b_n[0][1] * cosY;
+    const l_y = -C_b_n[1][0] * sinY + C_b_n[1][1] * cosY;
+    const l_z = -C_b_n[2][0] * sinY + C_b_n[2][1] * cosY;
+
+    const v_x = C_b_n[0][2];
+    const v_y = C_b_n[1][2];
+    const v_z = C_b_n[2][2];
+
+    const v_lat = l_x * vel.x + l_y * vel.y + l_z * vel.z;
+    const v_vert = v_x * vel.x + v_y * vel.y + v_z * vel.z;
 
     const H = Matrix.zeros(2, 15);
     // Row 0: lateral velocity constraint
-    H.set(0, 3, C_b_n[0][1]);
-    H.set(0, 4, C_b_n[1][1]);
-    H.set(0, 5, C_b_n[2][1]);
+    H.set(0, 3, l_x);
+    H.set(0, 4, l_y);
+    H.set(0, 5, l_z);
 
     // Row 1: vertical velocity constraint
-    H.set(1, 3, C_b_n[0][2]);
-    H.set(1, 4, C_b_n[1][2]);
-    H.set(1, 5, C_b_n[2][2]);
+    H.set(1, 3, v_x);
+    H.set(1, 4, v_y);
+    H.set(1, 5, v_z);
 
     const z = new Matrix([
       [-v_lat],
@@ -286,6 +339,34 @@ export class EkfCore {
     if (state === 'GOOD' || state === 'DEGRADED') {
       this.lastGnssPos = [...gnssPos];
       this.lastGnssUpdateTime = this.currentTime;
+      
+      // Yaw alignment logic
+      if (this.enableYawAlignment && effectiveVel !== null) {
+        const speed = Math.sqrt(effectiveVel[0]*effectiveVel[0] + effectiveVel[1]*effectiveVel[1]);
+        if (speed > 3.0) { // e.g. 3 m/s threshold
+          // GNSS Course
+          const gnssCourse = Math.atan2(effectiveVel[0], effectiveVel[1]); // Atan2(E, N)
+          // INS Forward Course (phone Y axis)
+          const C_b_n = this.ins.lastRotationMatrix;
+          const insY_E = C_b_n[0][1];
+          const insY_N = C_b_n[1][1];
+          const insCourse = Math.atan2(insY_E, insY_N);
+          
+          let angleDiff = gnssCourse - insCourse;
+          // Normalize to -PI to PI
+          while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+          while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+          
+          // Low-pass filter the offset
+          if (!this.yawOffsetActive) {
+            this.yawOffsetRad = angleDiff;
+            this.yawOffsetActive = true;
+          } else {
+            const alpha = 0.05; // Tunable smoothing factor
+            this.yawOffsetRad = (1 - alpha) * this.yawOffsetRad + alpha * angleDiff;
+          }
+        }
+      }
     }
 
     if (state === 'GOOD' || state === 'DEGRADED') {
@@ -344,12 +425,32 @@ export class EkfCore {
 
     } else {
       // WEAK_LOST State: Use AI pseudo-measurement and NHC
+      
+      // Phase 4: Bump / Pothole Gate for AI
+      // Check the recent IMU window for large magnitude deviations (bumps)
+      let windowHasBump = false;
+      if (this.enableBumpGate) {
+        for (const sample of recentImuWindow) {
+          const accMag = Math.sqrt(sample[0]*sample[0] + sample[1]*sample[1] + sample[2]*sample[2]);
+          const gyrMag = Math.sqrt(sample[3]*sample[3] + sample[4]*sample[4] + sample[5]*sample[5]);
+          if (Math.abs(accMag - 9.81) > 3.0 || gyrMag > 1.0) {
+            windowHasBump = true;
+            break;
+          }
+        }
+      }
+
       // 1. Ask AI for velocity error correction
-      const aiCorrection = this.aiModel.predictError(
-        state, 
-        recentImuWindow, 
-        [this.ins.velocity.x, this.ins.velocity.y]
-      );
+      let aiCorrection: number[] | null = null;
+      if (!windowHasBump) {
+        aiCorrection = this.aiModel.predictError(
+          state, 
+          recentImuWindow, 
+          [this.ins.velocity.x, this.ins.velocity.y]
+        );
+      } else {
+        console.warn("[Bump Gate] Skipping AI update due to severe vibration/bump in IMU window.");
+      }
       this.lastAiCorrection = aiCorrection ? [...aiCorrection] : null;
 
       // We'll update 2D velocity (vx = East, vy = North) from AI
@@ -376,11 +477,8 @@ export class EkfCore {
       this.applyMeasurementUpdate(H, z, R, 6.0);
 
       // 2. Apply Non-Holonomic Constraints (NHC) in WEAK_LOST mode
-      // Guard: only apply NHC after attitude is initialized. Before initialization,
-      // C_b_n is identity and lastSpecificForce contains ~9.81 m/s² gravity, which
-      // projects directly into navigation-frame v_lat and v_vert, driving them above
-      // ±60 m/s on the very first cycle and permanently saturating the velocity clamp.
-      if (this.isAttitudeInitialized) {
+      // Guard: only apply NHC after attitude is initialized.
+      if (this.enableNHC && this.isAttitudeInitialized && this.yawOffsetActive) {
         this.applyNhc(0.05, 0.01);
       }
     }
@@ -495,6 +593,28 @@ export class EkfCore {
       this.postZuptCooldown = this.POST_ZUPT_COOLDOWN_CYCLES;
       this.wasZuptActive = false;
     }
+  }
+
+  /**
+   * Applies a soft map-matched position constraint.
+   * @param pos Navigation-frame position [x, y, z] (usually z is unused/0)
+   * @param R_pos Measurement noise covariance (e.g. 5.0 for 5m confidence)
+   */
+  public updateMapMatch(pos: number[], R_pos: number = 5.0) {
+    const H = Matrix.zeros(2, 15);
+    H.set(0, 0, 1);
+    H.set(1, 1, 1);
+
+    const z = new Matrix([
+      [pos[0] - this.ins.position.x],
+      [pos[1] - this.ins.position.y]
+    ]);
+
+    const R = Matrix.eye(2).mul(R_pos);
+
+    // Mahalanobis gate around 15.0 to accept gentle corrections but reject huge jumps
+    this.applyMeasurementUpdate(H, z, R, 15.0);
+    this.applyVelocityGuard();
   }
 }
 

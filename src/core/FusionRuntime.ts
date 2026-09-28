@@ -2,6 +2,7 @@ import { useSensorStore } from '../store/useSensorStore';
 import { EkfCore } from './EkfCore';
 import { InsMechanization } from './InsMechanization';
 import { OutputStabilizer, StabilizerInput } from './OutputStabilizer';
+import { MapMatcher } from '../mapmatch/MapMatcher';
 
 export interface FusedState {
   latitude: number | null;
@@ -21,12 +22,28 @@ export interface FusedState {
     wasSmoothed: boolean;
     clampEvent?: any;
   };
+  mapSnapped?: {
+    lat: number;
+    lon: number;
+    segmentId: string | null;
+  };
+}
+
+export interface ImuSource {
+  timestamp: number; // ms
+  accel: { x: number; y: number; z: number };
+  gyro: { x: number; y: number; z: number };
+  mag?: { x: number; y: number; z: number };
 }
 
 class FusionRuntime {
   private ekf: EkfCore;
   private pureIns: InsMechanization;
   private outputStabilizer: OutputStabilizer;
+  public mapMatcher: MapMatcher = new MapMatcher();
+  public enableMapMatching: boolean = false;
+  private lastMapMatchTimestamp: number = 0;
+
   private isRunning = false;
   private unsubscribe: (() => void) | null = null;
 
@@ -38,6 +55,16 @@ class FusionRuntime {
   private initialLon: number | null = null;
   private isAttitudeInitialized = false;
 
+  // Phase 5: Latency Tracking
+  private lastValidGnssTs: number = 0;
+  private hasReportedLossLatency = false;
+  private gnssReturnTs: number = 0;
+  private hasReportedReturnLatency = false;
+  public latencyMetrics = {
+    lossLatencyMs: 0,
+    returnLatencyMs: 0
+  };
+
   // ZUPT hysteresis: require N consecutive non-stationary samples before releasing
   private wasZuptActiveLastCycle = false;
   private nonStationaryCount = 0;
@@ -47,7 +74,7 @@ class FusionRuntime {
   private readonly R_EARTH = 6378137;
 
   // Callback to update UI
-  private onFusedDataCallback: ((state: FusedState) => void) | null = null;
+  private onFusedDataCallbacks: Set<(state: FusedState) => void> = new Set();
 
   constructor() {
     this.ekf = new EkfCore();
@@ -60,7 +87,11 @@ class FusionRuntime {
   }
 
   public setOnFusedDataCallback(callback: (state: FusedState) => void) {
-    this.onFusedDataCallback = callback;
+    this.onFusedDataCallbacks.add(callback);
+  }
+
+  public removeOnFusedDataCallback(callback: (state: FusedState) => void) {
+    this.onFusedDataCallbacks.delete(callback);
   }
 
   public async start() {
@@ -126,16 +157,31 @@ class FusionRuntime {
       gnssVel[1] = gnss.speed * Math.cos(hdgRad); // North
     }
 
-    this.lastGnssTimestamp = Date.now();
+    const nowTs = state.gnss.timestamp || Date.now();
+    this.lastGnssTimestamp = nowTs;
+    this.lastValidGnssTs = nowTs;
+    
+    // Reset loss latency flag on valid GNSS
+    this.hasReportedLossLatency = false;
+    if (this.gnssReturnTs === 0) {
+      this.gnssReturnTs = nowTs; // First valid return
+    }
+    
     // Update EKF (which internally uses GnssQualityStateMachine)
     this.ekf.updateGnss(gnssPos, gnssVel, gnss.accuracy, this.imuWindow);
   }
 
-  private handleImuUpdate(state: any) {
-    const now = Date.now();
+  // Phase 5: Accept standard ImuSource interface
+  public feedExternalImu(source: ImuSource) {
+    this.handleImuUpdate(source);
+  }
+
+  private handleImuUpdate(state: any | ImuSource) {
+    // Phase 5: Derive dt from IMU timestamps rather than system Date.now() if available
+    const now = state.timestamp || Date.now();
     let dt = (now - this.lastImuTimestamp) / 1000.0;
     if (this.lastImuTimestamp === 0) {
-      dt = 0.1; // Default 100ms on first run
+      dt = 0.1; // Default on first run
     } else if (dt <= 0 || dt > 1.0) {
       console.warn(`[Guard] Invalid dt detected: ${dt}s. Skipping IMU update to prevent velocity runaway.`);
       this.lastImuTimestamp = now;
@@ -265,13 +311,59 @@ class FusionRuntime {
       this.ekf.updateGnss([0,0,0], [0,0,0], null, this.imuWindow);
       // Throttle IDR pseudo-updates to 1Hz
       this.lastGnssTimestamp = now - 1000;
+      
+      // Phase 5: Measure Loss Latency
+      if (!this.hasReportedLossLatency && this.lastValidGnssTs > 0) {
+        this.latencyMetrics.lossLatencyMs = now - this.lastValidGnssTs;
+        // console.log(`[Latency] GNSS Loss to first AI-aided output: ${this.latencyMetrics.lossLatencyMs} ms`);
+        this.hasReportedLossLatency = true;
+        this.gnssReturnTs = 0; // Reset return timer
+        this.hasReportedReturnLatency = false;
+      }
+    } else if (this.gnssReturnTs > 0 && !this.hasReportedReturnLatency) {
+       // Phase 5: Measure Return Latency
+       this.latencyMetrics.returnLatencyMs = now - this.gnssReturnTs;
+       // console.log(`[Latency] GNSS Return to first fused output: ${this.latencyMetrics.returnLatencyMs} ms`);
+       this.hasReportedReturnLatency = true;
+    }
+
+    // Phase 3: Map Matching Feedback
+    // Apply soft constraint at 1Hz max when we are moving and map matching is enabled
+    if (this.enableMapMatching && this.initialLat !== null && this.initialLon !== null && (now - this.lastMapMatchTimestamp >= 1000)) {
+      const vel = this.ekf.getIns().velocity;
+      const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
+      if (speed > 1.0) { // Only snap if moving
+        const pos = this.ekf.getPosition();
+        const latRad = this.initialLat * (Math.PI / 180);
+        const curLat = this.initialLat + (pos.y / this.R_EARTH) * (180 / Math.PI);
+        const curLon = this.initialLon + (pos.x / (this.R_EARTH * Math.cos(latRad))) * (180 / Math.PI);
+        
+        let headingDeg = this.ekf.getIns().attitude.yaw * (180 / Math.PI);
+        if (headingDeg < 0) headingDeg += 360;
+        const headingRad = headingDeg * Math.PI / 180;
+        
+        const snapRes = this.mapMatcher.snap(curLat, curLon, headingRad, speed);
+        
+        if (snapRes.segmentId && snapRes.confidence > 0) {
+          // Convert snapped lat/lon back to local ENU
+          const dx = (snapRes.lon - this.initialLon) * (Math.PI / 180) * this.R_EARTH * Math.cos(latRad);
+          const dy = (snapRes.lat - this.initialLat) * (Math.PI / 180) * this.R_EARTH;
+          
+          // Variance inversely proportional to confidence. 
+          // confidence=1 -> R=5.0m^2; confidence=0.1 -> R=50.0m^2
+          const R_pos = 5.0 / snapRes.confidence;
+          this.ekf.updateMapMatch([dx, dy, pos.z], R_pos);
+          
+          this.lastMapMatchTimestamp = now;
+        }
+      }
     }
 
     this.emitFusedState();
   }
 
   private emitFusedState() {
-    if (!this.onFusedDataCallback) return;
+    if (this.onFusedDataCallbacks.size === 0) return;
 
     const pos = this.ekf.getPosition();
     const vel = this.ekf.getIns().velocity;
@@ -299,6 +391,21 @@ class FusionRuntime {
       pureInsLon = this.pureIns.position.x * 0.00001;
     }
 
+    // Purely for visualization/metrics: what would the map matcher snap to?
+    let mapSnapped = undefined;
+    if (this.enableMapMatching && fusedLat !== null && fusedLon !== null) {
+        let hRad = att.yaw; // already radians
+        const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
+        const snapRes = this.mapMatcher.snap(fusedLat, fusedLon, hRad, speed);
+        if (snapRes.segmentId) {
+            mapSnapped = {
+                lat: snapRes.lat,
+                lon: snapRes.lon,
+                segmentId: snapRes.segmentId
+            };
+        }
+    }
+
     const state = this.ekf.getGnssState().getState();
     const sourceMode = (state === 'GOOD' || state === 'DEGRADED') ? 'GNSS' : 'IDR';
 
@@ -311,7 +418,7 @@ class FusionRuntime {
       const stabilizerInput: StabilizerInput = {
         lat: fusedLat,
         lon: fusedLon,
-        timestamp: Date.now(),
+        timestamp: this.lastImuTimestamp,
         gnssState: state
       };
       const stabilized = this.outputStabilizer.process(stabilizerInput);
@@ -326,12 +433,12 @@ class FusionRuntime {
 
     const biases = this.ekf.getBiases ? this.ekf.getBiases() : { accel: {x:0,y:0,z:0}, gyro: {x:0,y:0,z:0} };
 
-    this.onFusedDataCallback({
+    const stateObj = {
       latitude: fusedLat,
       longitude: fusedLon,
       velocity: vel,
       heading: headingDeg,
-      timestamp: Date.now(),
+      timestamp: this.lastImuTimestamp,
       sourceMode,
       gnssState: state,
       pureInsLatitude: pureInsLat,
@@ -339,8 +446,11 @@ class FusionRuntime {
       accelBias: biases.accel,
       gyroBias: biases.gyro,
       isAligned: this.isAttitudeInitialized,
-      stabilization: stabilizationInfo
-    });
+      stabilization: stabilizationInfo,
+      mapSnapped: mapSnapped
+    };
+
+    this.onFusedDataCallbacks.forEach(cb => cb(stateObj));
   }
 }
 

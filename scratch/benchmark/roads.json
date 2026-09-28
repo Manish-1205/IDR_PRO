@@ -1,0 +1,12 @@
+[
+  {
+    "id": "mock_way_0",
+    "wayId": 12345,
+    "p1": { "lat": 17.646, "lon": 75.951 },
+    "p2": { "lat": 17.647, "lon": 75.952 },
+    "roadClass": "primary",
+    "oneway": false,
+    "headingRad": 0.785398,
+    "lengthMeters": 150
+  }
+]
